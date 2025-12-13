@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -17,168 +14,51 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-type portDispatcher struct {
-	// sync.Mutex是结构体字段，值接收者方法里嵌入字段即可；无须指针字段
-	mu sync.Mutex // 这是go提供的互斥锁原语，实际不保护任何数据，需要用户自行遵守互斥锁的规范
+// ttlResult按TTL存放路由器地址列表；索引0空置，便于直接按TTL访问
+type ttlResult [][]string
 
-	sinks map[int]chan<- string // 表示key是int，value是“只能写”的string chan
+func newTTLResult(maxTTL int) ttlResult {
+	return make([][]string, maxTTL+1)
 }
 
-func newPortDispatcher() *portDispatcher {
-	return &portDispatcher{sinks: make(map[int]chan<- string)}
+// ttlState 记录每个TTL发送开始时间和已收到的响应数
+type ttlState struct {
+	start    time.Time
+	received int
 }
 
-// 这是go的method定义语法，本质是为p实现.register()的语法糖，实际效果等价为
-// func register(p *portDispatcher, port int, ch chan<- string)
-func (p *portDispatcher) register(port int, ch chan<- string) {
-	// defer调用是按栈执行的；对称加锁/解锁最常见写法
-	p.mu.Lock() // 这里p类型不管是值还是指针，都可以用.方法，按照C的语法理解就是.运算符重载了.和->
-	defer p.mu.Unlock()
-	p.sinks[port] = ch
-}
-
-func (p *portDispatcher) unregister(port int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.sinks, port)
-}
-
-func (p *portDispatcher) dispatch(port int, addr string) { // 就是根据port往指定channel塞string
-	p.mu.Lock()
-	ch := p.sinks[port]
-	p.mu.Unlock()
-	if ch != nil {
-		ch <- addr
-	}
-}
-
-type resultStore struct {
-	mu    sync.Mutex
-	hops  map[int][]string
-	count int
-}
-
-func newResultStore(maxTTL int) *resultStore {
-	return &resultStore{
-		hops:  make(map[int][]string, maxTTL),
-		count: maxTTL,
-	}
-}
-
-func (r *resultStore) add(ttl int, addrs []string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.hops[ttl] = append(r.hops[ttl], addrs...)
-}
-
-func (r *resultStore) get(ttl int) []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	src := r.hops[ttl]
-	dst := make([]string, len(src))
-	copy(dst, src)
-	return dst
-}
-
-func listenICMP(ctx context.Context, conn net.PacketConn, dispatcher *portDispatcher) {
-	defer conn.Close()
-
-	buf := make([]byte, 1500)
-	for {
-		// ReadDeadline可以让阻塞Read在超时后返回超时错误；避免goroutine永远阻塞
-		_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					continue
-				}
-			}
-			log.Printf("icmp read error: %v", err)
-			continue
-		}
-		srcPort, err := extractUDPSrcPort(buf[:n])
-		if err != nil {
-			log.Printf("extractUDPSrcPort error: %v", err)
-			continue
-		}
-		dispatcher.dispatch(srcPort, addr.String())
-	}
-}
-
-func extractUDPSrcPort(b []byte) (int, error) {
+// parseICMP复用gopacket解出内层UDP的目的端口（用于反查TTL）
+func parseICMP(b []byte) (int, string, error) {
 	pkt := gopacket.NewPacket(b, layers.LayerTypeICMPv4, gopacket.Default)
 	icmpLayer := pkt.Layer(layers.LayerTypeICMPv4)
 	if icmpLayer == nil {
-		return 0, fmt.Errorf("no icmp layer in: %X", b)
+		return 0, "", fmt.Errorf("no icmp layer")
 	}
 	icmp := icmpLayer.(*layers.ICMPv4)
 
 	innerpkt := gopacket.NewPacket(icmp.Payload, layers.LayerTypeIPv4, gopacket.Default)
 	innerIPLayer := innerpkt.Layer(layers.LayerTypeIPv4)
 	if innerIPLayer == nil {
-		return 0, fmt.Errorf("illegal icmp payload")
+		return 0, "", fmt.Errorf("illegal icmp payload")
 	}
 	innerIP := innerIPLayer.(*layers.IPv4)
 	if innerIP.Protocol != layers.IPProtocolUDP {
-		return 0, fmt.Errorf("icmp payload ip is not UDP")
+		return 0, "", fmt.Errorf("icmp payload ip is not UDP")
 	}
 
 	udpLayer := innerpkt.Layer(layers.LayerTypeUDP)
 	if udpLayer == nil {
-		return 0, fmt.Errorf("udp layer missing")
+		return 0, "", fmt.Errorf("udp layer missing")
 	}
 	udp := udpLayer.(*layers.UDP)
-	return int(udp.SrcPort), nil
-}
 
-func probeTTL(ctx context.Context, ttl int, probes int, basePayload int, timeout time.Duration, target *net.IPAddr, basePort int, dispatcher *portDispatcher, results *resultStore) {
-	conn, err := dialUDPWithTTL(ttl, target.IP.String(), basePort+ttl)
-	if err != nil {
-		log.Printf("ttl=%d dial error: %v", ttl, err)
-		return
-	}
-	defer conn.Close()
-
-	// 类型断言：接口值.(具体类型)，第二个返回值bool表示断言是否成功
-	localUDP, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		log.Printf("ttl=%d unexpected local addr type", ttl)
-		return
-	}
-
-	respCh := make(chan string, probes*2)      // make第二个参数用在这里指chan的缓冲区大小
-	dispatcher.register(localUDP.Port, respCh) // 建立 port-ch 映射
-	defer dispatcher.unregister(localUDP.Port)
-
-	payload := bytes.Repeat([]byte{0}, basePayload)
-	for i := 0; i < probes; i++ {
-		_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-		if _, err := conn.Write(payload); err != nil {
-			log.Printf("ttl=%d send error: %v", ttl, err)
+	// 外层ICMP包的源地址就是路由器地址
+	if ipLayer := pkt.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+		if ip := ipLayer.(*layers.IPv4); ip != nil {
+			return int(udp.DstPort), ip.SrcIP.String(), nil
 		}
 	}
-
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-
-	var routers []string
-	for len(routers) < probes {
-		select {
-		case addr := <-respCh:
-			routers = append(routers, addr)
-		case <-deadline.C:
-			results.add(ttl, routers)
-			return
-		case <-ctx.Done():
-			results.add(ttl, routers)
-			return
-		}
-	}
-	results.add(ttl, routers)
+	return int(udp.DstPort), "", nil
 }
 
 func dialUDPWithTTL(ttl int, ip string, port int) (*net.UDPConn, error) {
@@ -201,6 +81,7 @@ func dialUDPWithTTL(ttl int, ip string, port int) (*net.UDPConn, error) {
 	return nil, fmt.Errorf("unexpected conn type")
 }
 
+// dedup保留出现顺序，移除重复项
 func dedup(items []string) []string {
 	seen := make(map[string]struct{}, len(items))
 	out := make([]string, 0, len(items))
@@ -214,13 +95,14 @@ func dedup(items []string) []string {
 	return out
 }
 
+func formatHops(hops []string) string {
+	return strings.Join(hops, "  ")
+}
+
 func main() {
-	// ---------------------------------
-	//           Parse Args
-	// ---------------------------------
 	maxTTL := flag.Int("max-ttl", 30, "maximum TTL to probe")
 	probes := flag.Int("probes", 3, "number of probes per TTL")
-	basePayload := flag.Int("payload", 32, "base payload length")
+	basePayload := flag.String("payload", "Hello", "payload content")
 	timeout := flag.Duration("timeout", 2*time.Second, "wait time per TTL")
 	basePort := flag.Int("dport", 33434, "base destination UDP port")
 	flag.Parse()
@@ -232,64 +114,84 @@ func main() {
 	}
 	target := flag.Arg(0)
 
-	// ---------------------------------
-	//          Domain Resolve
-	// ---------------------------------
-	ip, err := net.ResolveIPAddr("ip4", target) // net.ResolveIPAddr 接收IP直接返回，接收domain会解析
+	ip, err := net.ResolveIPAddr("ip4", target)
 	if err != nil {
 		log.Fatalf("resolve target: %v", err)
 	}
 	fmt.Printf("Traceroute to %s(%s)\n", target, ip)
 
-	// ---------------------------------
-	//          ICMP Listening
-	// ---------------------------------
-	icmpConn, err := net.ListenPacket("ip4:icmp", "0.0.0.0") // 创建接收
+	// 先创建ICMP监听，后续读写都围绕这一个socket
+	icmpConn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		log.Fatalf("listen icmp: %v", err)
 	}
+	defer icmpConn.Close()
 
-	// context库用于在goroutine间传递取消、超时、截止信号
-	// 调用cancel()时，这个ctx 会被“标记为已取消”
-	// 用于和select, <-ctx.Done() 结合完成取消通知
-	// cancel可以被调用多次，推荐defer cancel() + 手动cancel()
-	// 一旦 ctx 被取消，ctx.Done() 对应的 channel 会被关闭；
-	// 对“已关闭 channel”的接收操作，永远不会阻塞。
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// port->ttl映射，用发送阶段记录，接收阶段反查；使用目的端口唯一标识每个TTL
+	portTTL := make(map[int]int, *maxTTL)
+	results := newTTLResult(*maxTTL)
+	state := make([]ttlState, *maxTTL+1)
 
-	dispatcher := newPortDispatcher()
-	go listenICMP(ctx, icmpConn, dispatcher)
-
-	results := newResultStore(*maxTTL)
-
-	// ---------------------------------
-	//          Send UDP
-	// ---------------------------------
-	// 并发n个goroutine同时执行一段代码，并等待它们运行结束的模板
-	// var wg sync.WaitGroup
-	// for a := 1; a <= amax; a++ {
-	// 	wg.Add(1)
-	// 	go func(t int) {
-	// 		defer wg.Done()
-	// 		...
-	// 	}(a)
-	// }
-	// wg.Wait()
-
-	var wg sync.WaitGroup
+	// 非阻塞遍历TTL，逐一发送UDP探测
 	for ttl := 1; ttl <= *maxTTL; ttl++ {
-		wg.Add(1)
-		go func(t int) {
-			defer wg.Done()
-			probeTTL(ctx, t, *probes, *basePayload, *timeout, ip, *basePort, dispatcher, results)
-		}(ttl) // 函数字面量捕获变量时要传参；否则会闭包共享同一个循环变量
+		dstPort := *basePort + ttl
+		conn, err := dialUDPWithTTL(ttl, ip.IP.String(), dstPort)
+		if err != nil {
+			log.Printf("ttl=%d dial error: %v", ttl, err)
+			continue
+		}
+		portTTL[dstPort] = ttl
+		state[ttl] = ttlState{start: time.Now()}
+
+		payload := []byte(*basePayload)
+		for i := 0; i < *probes; i++ {
+			_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			if _, err := conn.Write(payload); err != nil {
+				log.Printf("ttl=%d send error: %v", ttl, err)
+			}
+		}
+		_ = conn.Close()
 	}
-	wg.Wait()
-	cancel()
+
+	// 不断从icmp socket读取；根据portTTL反推是哪个TTL的响应
+	buf := make([]byte, 1500)
+	// 总等待时间上界：每个TTL timeout，各自起始时间不同，所以循环通过“全部TTL都超时或收满”判定退出
+	for {
+		_ = icmpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, addr, err := icmpConn.ReadFrom(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if allTTLFinished(state, *probes, *timeout) {
+					break
+				}
+				continue
+			}
+			log.Printf("icmp read error: %v", err)
+			continue
+		}
+
+		srcPort, routerIP, err := parseICMP(buf[:n])
+		if err != nil {
+			log.Printf("parse icmp error: %v", err)
+			continue
+		}
+		ttl, ok := portTTL[srcPort]
+		if !ok {
+			// 未知端口，忽略
+			continue
+		}
+		if routerIP == "" { // 回退用addr
+			routerIP = addr.String()
+		}
+		results[ttl] = append(results[ttl], routerIP)
+		state[ttl].received++
+		if allTTLFinished(state, *probes, *timeout) {
+			break
+		}
+	}
 
 	for ttl := 1; ttl <= *maxTTL; ttl++ {
-		hops := dedup(results.get(ttl))
+		hops := dedup(results[ttl])
 		if len(hops) == 0 {
 			fmt.Printf("%2d  *\n", ttl)
 			continue
@@ -298,6 +200,16 @@ func main() {
 	}
 }
 
-func formatHops(hops []string) string {
-	return strings.Join(hops, "  ")
+func allTTLFinished(state []ttlState, probes int, timeout time.Duration) bool {
+	now := time.Now()
+	for ttl := 1; ttl < len(state); ttl++ {
+		s := state[ttl]
+		if s.start.IsZero() {
+			continue
+		}
+		if s.received < probes && now.Sub(s.start) < timeout {
+			return false
+		}
+	}
+	return true
 }
