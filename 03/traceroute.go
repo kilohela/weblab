@@ -35,6 +35,11 @@ func parseICMP(b []byte) (int, string, error) {
 		return 0, "", fmt.Errorf("no icmp layer")
 	}
 	icmp := icmpLayer.(*layers.ICMPv4)
+	isTTLExceeded := icmp.TypeCode.Type() == layers.ICMPv4TypeTimeExceeded && icmp.TypeCode.Code() == 0
+	isPortUnreachable := icmp.TypeCode.Type() == layers.ICMPv4TypeDestinationUnreachable && icmp.TypeCode.Code() == 3
+	if !isTTLExceeded && !isPortUnreachable {
+		return 0, "", fmt.Errorf("unsupported icmp type/code: %v", icmp.TypeCode)
+	}
 
 	innerpkt := gopacket.NewPacket(icmp.Payload, layers.LayerTypeIPv4, gopacket.Default)
 	innerIPLayer := innerpkt.Layer(layers.LayerTypeIPv4)
@@ -55,7 +60,11 @@ func parseICMP(b []byte) (int, string, error) {
 	// 外层ICMP包的源地址就是路由器地址
 	if ipLayer := pkt.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 		if ip := ipLayer.(*layers.IPv4); ip != nil {
-			return int(udp.DstPort), ip.SrcIP.String(), nil
+			router := ip.SrcIP.String()
+			if isPortUnreachable {
+				router += " destination"
+			}
+			return int(udp.DstPort), router, nil
 		}
 	}
 	return int(udp.DstPort), "", nil
@@ -170,12 +179,12 @@ func main() {
 			continue
 		}
 
-		srcPort, routerIP, err := parseICMP(buf[:n])
+		dstPort, routerIP, err := parseICMP(buf[:n])
 		if err != nil {
 			log.Printf("parse icmp error: %v", err)
 			continue
 		}
-		ttl, ok := portTTL[srcPort]
+		ttl, ok := portTTL[dstPort]
 		if !ok {
 			// 未知端口，忽略
 			continue
