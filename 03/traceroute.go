@@ -29,6 +29,7 @@ type ttlState struct {
 
 // parseICMP复用gopacket解出内层UDP的目的端口（用于反查TTL）
 func parseICMP(b []byte) (int, string, error) {
+	// fmt.Printf("original icmp bytestream: %X\n", b)
 	pkt := gopacket.NewPacket(b, layers.LayerTypeICMPv4, gopacket.Default)
 	icmpLayer := pkt.Layer(layers.LayerTypeICMPv4)
 	if icmpLayer == nil {
@@ -136,30 +137,31 @@ func main() {
 	}
 	defer icmpConn.Close()
 
-	// port->ttl映射，用发送阶段记录，接收阶段反查；使用目的端口唯一标识每个TTL
+	// port->ttl映射，用发送阶段记录，接收阶段反查；使用目的端口唯一标识每个探测
 	portTTL := make(map[int]int, *maxTTL)
 	results := newTTLResult(*maxTTL)
 	state := make([]ttlState, *maxTTL+1)
 
-	// 非阻塞遍历TTL，逐一发送UDP探测
+	// 非阻塞遍历TTL，逐一发送UDP探测，每个probe使用不同目的端口
 	for ttl := 1; ttl <= *maxTTL; ttl++ {
-		dstPort := *basePort + ttl
-		conn, err := dialUDPWithTTL(ttl, ip.IP.String(), dstPort)
-		if err != nil {
-			log.Printf("ttl=%d dial error: %v", ttl, err)
-			continue
-		}
-		portTTL[dstPort] = ttl
-		state[ttl] = ttlState{start: time.Now()}
-
 		payload := []byte(*basePayload)
 		for i := 0; i < *probes; i++ {
+			dstPort := *basePort + ttl**probes + i
+			conn, err := dialUDPWithTTL(ttl, ip.IP.String(), dstPort)
+			if err != nil {
+				log.Printf("ttl=%d probe=%d dial error: %v", ttl, i, err)
+				continue
+			}
+			portTTL[dstPort] = ttl
+			if state[ttl].start.IsZero() {
+				state[ttl] = ttlState{start: time.Now()}
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 			if _, err := conn.Write(payload); err != nil {
-				log.Printf("ttl=%d send error: %v", ttl, err)
+				log.Printf("ttl=%d probe=%d send error: %v", ttl, i, err)
 			}
+			_ = conn.Close()
 		}
-		_ = conn.Close()
 	}
 
 	// 不断从icmp socket读取；根据portTTL反推是哪个TTL的响应
