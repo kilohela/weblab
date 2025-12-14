@@ -71,26 +71,6 @@ func parseICMP(b []byte) (int, string, error) {
 	return int(udp.DstPort), "", nil
 }
 
-func dialUDPWithTTL(ttl int, ip string, port int) (*net.UDPConn, error) {
-	dialer := net.Dialer{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-			})
-		},
-		Timeout: 2 * time.Second,
-	}
-	conn, err := dialer.Dial("udp4", fmt.Sprintf("%s:%d", ip, port))
-	if err != nil {
-		return nil, err
-	}
-	if udpConn, ok := conn.(*net.UDPConn); ok {
-		return udpConn, nil
-	}
-	_ = conn.Close()
-	return nil, fmt.Errorf("unexpected conn type")
-}
-
 // dedup保留出现顺序，移除重复项
 func dedup(items []string) []string {
 	seen := make(map[string]struct{}, len(items))
@@ -107,6 +87,23 @@ func dedup(items []string) []string {
 
 func formatHops(hops []string) string {
 	return strings.Join(hops, "  ")
+}
+
+// setTTL 复用UDP socket时动态调整IP_TTL
+func setTTL(conn *net.UDPConn, ttl int) error {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if err := raw.Control(func(fd uintptr) {
+		if e := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl); e != nil {
+			serr = e
+		}
+	}); err != nil {
+		return err
+	}
+	return serr
 }
 
 func main() {
@@ -136,6 +133,11 @@ func main() {
 		log.Fatalf("listen icmp: %v", err)
 	}
 	defer icmpConn.Close()
+	udpConn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		log.Fatalf("listen udp: %v", err)
+	}
+	defer udpConn.Close()
 
 	// port->ttl映射，用发送阶段记录，接收阶段反查；使用目的端口唯一标识每个探测
 	portTTL := make(map[int]int, *maxTTL)
@@ -147,20 +149,19 @@ func main() {
 		payload := []byte(*basePayload)
 		for i := 0; i < *probes; i++ {
 			dstPort := *basePort + ttl**probes + i
-			conn, err := dialUDPWithTTL(ttl, ip.IP.String(), dstPort)
-			if err != nil {
-				log.Printf("ttl=%d probe=%d dial error: %v", ttl, i, err)
+			if err := setTTL(udpConn, ttl); err != nil {
+				log.Printf("ttl=%d probe=%d set ttl error: %v", ttl, i, err)
 				continue
 			}
 			portTTL[dstPort] = ttl
 			if state[ttl].start.IsZero() {
 				state[ttl] = ttlState{start: time.Now()}
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-			if _, err := conn.Write(payload); err != nil {
+			_ = udpConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			dstAddr := &net.UDPAddr{IP: ip.IP, Port: dstPort}
+			if _, err := udpConn.WriteToUDP(payload, dstAddr); err != nil {
 				log.Printf("ttl=%d probe=%d send error: %v", ttl, i, err)
 			}
-			_ = conn.Close()
 		}
 	}
 
